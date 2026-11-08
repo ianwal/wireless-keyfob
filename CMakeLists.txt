@@ -23,7 +23,7 @@ if (EXISTS ${picoVscode})
     include(${picoVscode})
 endif()
 # ====================================================================================
-set(PICO_BOARD pico2 CACHE STRING "Board type")
+set(PICO_BOARD pico2_w CACHE STRING "Board type")
 
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
@@ -37,9 +37,14 @@ set(PICO_CXX_ENABLE_RTTI 1)
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
+add_compile_options(-fdiagnostics-color)
+
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(wireless-keyfob wireless-keyfob.cpp )
+add_executable(wireless-keyfob 
+    # wireless-keyfob.cpp
+    server.cpp
+)
 
 pico_set_program_name(wireless-keyfob "wireless-keyfob")
 pico_set_program_version(wireless-keyfob "0.1")
@@ -50,12 +55,22 @@ pico_enable_stdio_usb(wireless-keyfob 1)
 
 # Add the standard library to the build
 target_link_libraries(wireless-keyfob
-        pico_stdlib)
+        pico_btstack_ble
+        pico_btstack_cyw43
+        pico_stdlib
+        pico_cyw43_arch_none
+        hardware_adc # TODO: Remove, only needed for server example
+)
 
 # Add the standard include files to the build
 target_include_directories(wireless-keyfob PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
 )
 
-pico_add_extra_outputs(wireless-keyfob)
+target_compile_definitions(wireless-keyfob PRIVATE
+    #WANT_HCI_DUMP=1
+)
 
+pico_btstack_make_gatt_header(wireless-keyfob PRIVATE "${CMAKE_CURRENT_LIST_DIR}/temp_sensor.gatt")
+
+pico_add_extra_outputs(wireless-keyfob)
