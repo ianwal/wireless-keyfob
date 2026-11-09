@@ -1,15 +1,27 @@
-/**
- * Copyright (c) 2023 Raspberry Pi (Trading) Ltd.
- *
- * SPDX-License-Identifier: BSD-3-Clause
- */
-
 #include <stdio.h>
 #include "btstack.h"
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
+#include "pico/util/queue.h"
+#include "pico/multicore.h"
+#include "hardware/gpio.h"
 
 #include "car_common.h"
+
+#include <cstdint>
+
+// Optocoupler GPIO pins
+static constexpr uint lock_gpio_pin = 10;
+static constexpr uint unlock_gpio_pin = 11;
+static constexpr uint trunk_gpio_pin = 12;
+
+typedef struct
+{
+    std::int32_t data;
+} queue_entry_t;
+
+// Queue for commands received from Bluetooth.
+static queue_t command_queue;
 
 #ifndef NDEBUG
 #define DEBUG_LOG(...) printf(__VA_ARGS__)
@@ -155,18 +167,24 @@ static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint
                             case Car_command::LOCK:
                             {
                                 INFO_LOG("Lock command received.\n");
+                                queue_entry_t entry{static_cast<decltype(queue_entry_t::data)>(Car_command::LOCK)};
+                                queue_try_add(&command_queue, &entry);
                             }
                             break;
 
                             case Car_command::UNLOCK:
                             {
                                 INFO_LOG("Unlock command received.\n");
+                                queue_entry_t entry{static_cast<decltype(queue_entry_t::data)>(Car_command::UNLOCK)};
+                                queue_try_add(&command_queue, &entry);
                             }
                             break;
 
                             case Car_command::TRUNK:
                             {
                                 INFO_LOG("Trunk command received.\n");
+                                queue_entry_t entry{static_cast<decltype(queue_entry_t::data)>(Car_command::TRUNK)};
+                                queue_try_add(&command_queue, &entry);
                             }
                             break;
 
@@ -276,8 +294,61 @@ static void heartbeat_handler(struct btstack_timer_source *ts) {
     btstack_run_loop_add_timer(ts);
 }
 
+/// @brief Write the output to GPIO for the given command.
+///
+/// @todo Write to GPIO.
+void execute_car_command(Car_command const command)
+{
+    static constexpr std::uint32_t on_duration = 150; // in ms
+    switch (command)
+    {
+        case Car_command::LOCK:
+        {
+            INFO_LOG("Lock command executed.\n");
+            gpio_put(lock_gpio_pin, true);
+            sleep_ms(on_duration);
+            gpio_put(lock_gpio_pin, false);
+        }
+        break;
+
+        case Car_command::UNLOCK:
+        {
+            INFO_LOG("Unlock command executed.\n");
+            gpio_put(unlock_gpio_pin, true);
+            sleep_ms(on_duration);
+            gpio_put(unlock_gpio_pin, false);
+        }
+        break;
+
+        case Car_command::TRUNK:
+        {
+            INFO_LOG("Trunk command executed.\n");
+            gpio_put(trunk_gpio_pin, true);
+            sleep_ms(on_duration);
+            gpio_put(trunk_gpio_pin, false);
+        }
+        break;
+
+        default:
+        {
+            ERROR_LOG("Unexpected car command attempted to be executed. %d\n", static_cast<int>(command));
+        }
+        break;
+    }
+}
+
 int main() {
     stdio_init_all();
+
+    queue_init(&command_queue, sizeof(queue_entry_t), 4);
+
+    gpio_init(lock_gpio_pin);
+    gpio_init(unlock_gpio_pin);
+    gpio_init(trunk_gpio_pin);
+
+    gpio_set_dir(lock_gpio_pin, GPIO_OUT);
+    gpio_set_dir(unlock_gpio_pin, GPIO_OUT);
+    gpio_set_dir(trunk_gpio_pin, GPIO_OUT);
 
     // initialize CYW43 driver architecture (will enable BT if/because CYW43_ENABLE_BLUETOOTH == 1)
     if (cyw43_arch_init()) {
@@ -305,23 +376,16 @@ int main() {
     // turn on!
     hci_power_control(HCI_POWER_ON);
 
-    // btstack_run_loop_execute is only required when using the 'polling' method (e.g. using pico_cyw43_arch_poll library).
-    // This example uses the 'threadsafe background` method, where BT work is handled in a low priority IRQ, so it
-    // is fine to call bt_stack_run_loop_execute() but equally you can continue executing user code.
-
-#if 1 // this is only necessary when using polling (which we aren't, but we're showing it is still safe to call in this case)
-    btstack_run_loop_execute();
-#else
     // this core is free to do it's own stuff except when using 'polling' method (in which case you should use 
-    // btstacK_run_loop_ methods to add work to the run loop.
-
+    // btstack_run_loop_ methods to add work to the run loop.
     // this is a forever loop in place of where user code would go.
-    while(true) {      
-        sleep_ms(1000);
-    }
-#endif
+    while (true) {
+        queue_entry_t res;   
+        if (queue_try_remove(&command_queue, &res))
+        {
+            execute_car_command(static_cast<Car_command>(res.data));
+        }
 
-    while(true) {      
         sleep_ms(1000);
     }
 

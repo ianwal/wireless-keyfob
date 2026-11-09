@@ -42,8 +42,8 @@ add_compile_options(-fdiagnostics-color)
 # Add executable. Default name is the project name, version 0.1
 
 add_executable(wireless-keyfob 
-    # wireless-keyfob.cpp
-    server.cpp
+    wireless-keyfob.cpp
+    # server.cpp
 )
 
 pico_set_program_name(wireless-keyfob "wireless-keyfob")
