@@ -1,26 +1,27 @@
-#include <stdio.h>
 #include "btstack.h"
+#include "hardware/gpio.h"
 #include "pico/cyw43_arch.h"
+#include "pico/multicore.h"
 #include "pico/stdlib.h"
 #include "pico/util/queue.h"
-#include "pico/multicore.h"
-#include "hardware/gpio.h"
 
 #include "car_common.h"
 
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 
 // Optocoupler GPIO pins
-static constexpr uint lock_gpio_pin = 10;
+static constexpr uint lock_gpio_pin   = 10;
 static constexpr uint unlock_gpio_pin = 11;
-static constexpr uint trunk_gpio_pin = 12;
+static constexpr uint trunk_gpio_pin  = 12;
 
-typedef struct
-{
+/// Intercore queue datatype
+typedef struct {
     std::int32_t data;
 } queue_entry_t;
 
-// Queue for commands received from Bluetooth.
+/// Intercore queue for commands received from Bluetooth
 static queue_t command_queue;
 
 #ifndef NDEBUG
@@ -56,29 +57,32 @@ static bool listener_registered;
 static gatt_client_notification_t notification_listener;
 static btstack_timer_source_t heartbeat;
 
-static void client_start(void){
-    DEBUG_LOG("Start scanning!\n");
+static void client_start(void)
+{
+    DEBUG_LOG("Start scanning.\n");
     state = TC_W4_SCAN_RESULT;
-    gap_set_scan_parameters(0,0x0030, 0x0030);
+    gap_set_scan_parameters(0, 0x0030, 0x0030);
     gap_start_scan();
 }
 
-static bool advertisement_report_contains_service(uint16_t service, uint8_t *advertisement_report){
+static bool advertisement_report_contains_service(uint16_t service, uint8_t* advertisement_report)
+{
     // get advertisement from report event
-    const uint8_t * adv_data = gap_event_advertising_report_get_data(advertisement_report);
-    uint8_t adv_len  = gap_event_advertising_report_get_data_length(advertisement_report);
+    uint8_t const* adv_data = gap_event_advertising_report_get_data(advertisement_report);
+    uint8_t adv_len         = gap_event_advertising_report_get_data_length(advertisement_report);
 
     // iterate over advertisement data
     ad_context_t context;
-    for (ad_iterator_init(&context, adv_len, adv_data) ; ad_iterator_has_more(&context) ; ad_iterator_next(&context)){
-        uint8_t data_type = ad_iterator_get_data_type(&context);
-        uint8_t data_size = ad_iterator_get_data_len(&context);
-        const uint8_t * data = ad_iterator_get_data(&context);
-        switch (data_type){
+    for (ad_iterator_init(&context, adv_len, adv_data); ad_iterator_has_more(&context); ad_iterator_next(&context)) {
+        uint8_t data_type   = ad_iterator_get_data_type(&context);
+        uint8_t data_size   = ad_iterator_get_data_len(&context);
+        uint8_t const* data = ad_iterator_get_data(&context);
+        switch (data_type) {
             case BLUETOOTH_DATA_TYPE_COMPLETE_LIST_OF_16_BIT_SERVICE_CLASS_UUIDS:
                 for (int i = 0; i < data_size; i += 2) {
                     uint16_t type = little_endian_read_16(data, i);
-                    if (type == service) return true;
+                    if (type == service)
+                        return true;
                 }
             default:
                 break;
@@ -87,15 +91,16 @@ static bool advertisement_report_contains_service(uint16_t service, uint8_t *adv
     return false;
 }
 
-static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
-    UNUSED(packet_type);
-    UNUSED(channel);
-    UNUSED(size);
+static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size)
+{
+    static_cast<void>(packet_type);
+    static_cast<void>(channel);
+    static_cast<void>(size);
 
-    uint8_t att_status;
-    switch(state){
+    uint8_t att_status{};
+    switch (state) {
         case TC_W4_SERVICE_RESULT:
-            switch(hci_event_packet_get_type(packet)) {
+            switch (hci_event_packet_get_type(packet)) {
                 case GATT_EVENT_SERVICE_QUERY_RESULT:
                     // store service (we expect only one)
                     DEBUG_LOG("Storing service\n");
@@ -103,51 +108,54 @@ static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint
                     break;
                 case GATT_EVENT_QUERY_COMPLETE:
                     att_status = gatt_event_query_complete_get_att_status(packet);
-                    if (att_status != ATT_ERROR_SUCCESS){
+                    if (att_status != ATT_ERROR_SUCCESS) {
                         ERROR_LOG("SERVICE_QUERY_RESULT, ATT Error 0x%02x.\n", att_status);
                         gap_disconnect(con_handle);
-                        break;  
-                    } 
+                        break;
+                    }
                     // service query complete, look for characteristic
                     state = TC_W4_CHARACTERISTIC_RESULT;
                     DEBUG_LOG("Search for env sensing characteristic.\n");
-                    gatt_client_discover_characteristics_for_service_by_uuid16(handle_gatt_client_event, con_handle, &server_service, ORG_BLUETOOTH_CHARACTERISTIC_TEMPERATURE);
+                    gatt_client_discover_characteristics_for_service_by_uuid16(handle_gatt_client_event, con_handle, &server_service,
+                                                                               ORG_BLUETOOTH_CHARACTERISTIC_TEMPERATURE);
                     break;
                 default:
                     break;
             }
             break;
         case TC_W4_CHARACTERISTIC_RESULT:
-            switch(hci_event_packet_get_type(packet)) {
+            switch (hci_event_packet_get_type(packet)) {
                 case GATT_EVENT_CHARACTERISTIC_QUERY_RESULT:
                     DEBUG_LOG("Storing characteristic\n");
                     gatt_event_characteristic_query_result_get_characteristic(packet, &server_characteristic);
                     break;
                 case GATT_EVENT_QUERY_COMPLETE:
                     att_status = gatt_event_query_complete_get_att_status(packet);
-                    if (att_status != ATT_ERROR_SUCCESS){
+                    if (att_status != ATT_ERROR_SUCCESS) {
                         ERROR_LOG("CHARACTERISTIC_QUERY_RESULT, ATT Error 0x%02x.\n", att_status);
                         gap_disconnect(con_handle);
-                        break;  
-                    } 
+                        break;
+                    }
                     // register handler for notifications
                     listener_registered = true;
-                    gatt_client_listen_for_characteristic_value_updates(&notification_listener, handle_gatt_client_event, con_handle, &server_characteristic);
+                    gatt_client_listen_for_characteristic_value_updates(&notification_listener, handle_gatt_client_event, con_handle,
+                                                                        &server_characteristic);
                     // enable notifications
                     DEBUG_LOG("Enable notify on characteristic.\n");
                     state = TC_W4_ENABLE_NOTIFICATIONS_COMPLETE;
-                    gatt_client_write_client_characteristic_configuration(handle_gatt_client_event, con_handle,
-                        &server_characteristic, GATT_CLIENT_CHARACTERISTICS_CONFIGURATION_NOTIFICATION);
+                    gatt_client_write_client_characteristic_configuration(handle_gatt_client_event, con_handle, &server_characteristic,
+                                                                          GATT_CLIENT_CHARACTERISTICS_CONFIGURATION_NOTIFICATION);
                     break;
                 default:
                     break;
             }
             break;
         case TC_W4_ENABLE_NOTIFICATIONS_COMPLETE:
-            switch(hci_event_packet_get_type(packet)) {
+            switch (hci_event_packet_get_type(packet)) {
                 case GATT_EVENT_QUERY_COMPLETE:
                     DEBUG_LOG("Notifications enabled, ATT status 0x%02x\n", gatt_event_query_complete_get_att_status(packet));
-                    if (gatt_event_query_complete_get_att_status(packet) != ATT_ERROR_SUCCESS) break;
+                    if (gatt_event_query_complete_get_att_status(packet) != ATT_ERROR_SUCCESS)
+                        break;
                     state = TC_W4_READY;
                     break;
                 default:
@@ -155,44 +163,35 @@ static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint
             }
             break;
         case TC_W4_READY:
-            switch(hci_event_packet_get_type(packet)) {
+            switch (hci_event_packet_get_type(packet)) {
                 case GATT_EVENT_NOTIFICATION: {
                     uint16_t value_length = gatt_event_notification_get_value_length(packet);
-                    const uint8_t *value = gatt_event_notification_get_value(packet);
+                    uint8_t const* value  = gatt_event_notification_get_value(packet);
                     DEBUG_LOG("Indication value len %d\n", value_length);
                     if (value_length == 2) {
                         auto const car_command = static_cast<Car_command>(little_endian_read_16(value, 0));
-                        switch (car_command)
-                        {
-                            case Car_command::LOCK:
-                            {
+                        switch (car_command) {
+                            case Car_command::LOCK: {
                                 INFO_LOG("Lock command received.\n");
-                                queue_entry_t entry{static_cast<decltype(queue_entry_t::data)>(Car_command::LOCK)};
+                                queue_entry_t entry{ static_cast<decltype(queue_entry_t::data)>(Car_command::LOCK) };
                                 queue_try_add(&command_queue, &entry);
-                            }
-                            break;
+                            } break;
 
-                            case Car_command::UNLOCK:
-                            {
+                            case Car_command::UNLOCK: {
                                 INFO_LOG("Unlock command received.\n");
-                                queue_entry_t entry{static_cast<decltype(queue_entry_t::data)>(Car_command::UNLOCK)};
+                                queue_entry_t entry{ static_cast<decltype(queue_entry_t::data)>(Car_command::UNLOCK) };
                                 queue_try_add(&command_queue, &entry);
-                            }
-                            break;
+                            } break;
 
-                            case Car_command::TRUNK:
-                            {
+                            case Car_command::TRUNK: {
                                 INFO_LOG("Trunk command received.\n");
-                                queue_entry_t entry{static_cast<decltype(queue_entry_t::data)>(Car_command::TRUNK)};
+                                queue_entry_t entry{ static_cast<decltype(queue_entry_t::data)>(Car_command::TRUNK) };
                                 queue_try_add(&command_queue, &entry);
-                            }
-                            break;
+                            } break;
 
-                            default:
-                            {
+                            default: {
                                 ERROR_LOG("Unexpected car command %d\n", static_cast<int>(car_command));
-                            }
-                            break;
+                            } break;
                         }
                     } else {
                         ERROR_LOG("Unexpected length %d\n", value_length);
@@ -205,20 +204,22 @@ static void handle_gatt_client_event(uint8_t packet_type, uint16_t channel, uint
             }
             break;
         default:
-            assert(false);
             ERROR_LOG("Unexpected state %d\n", state);
             break;
     }
 }
 
-static void hci_event_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
-    UNUSED(size);
-    UNUSED(channel);
+static void hci_event_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size)
+{
+    static_cast<void>(size);
+    static_cast<void>(channel);
+
     bd_addr_t local_addr;
-    if (packet_type != HCI_EVENT_PACKET) return;
+    if (packet_type != HCI_EVENT_PACKET)
+        return;
 
     uint8_t event_type = hci_event_packet_get_type(packet);
-    switch(event_type){
+    switch (event_type) {
         case BTSTACK_EVENT_STATE:
             if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
                 gap_local_bd_addr(local_addr);
@@ -229,9 +230,11 @@ static void hci_event_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
             }
             break;
         case GAP_EVENT_ADVERTISING_REPORT:
-            if (state != TC_W4_SCAN_RESULT) return;
+            if (state != TC_W4_SCAN_RESULT)
+                return;
             // check name in advertisement
-            if (!advertisement_report_contains_service(ORG_BLUETOOTH_SERVICE_ENVIRONMENTAL_SENSING, packet)) return;
+            if (!advertisement_report_contains_service(ORG_BLUETOOTH_SERVICE_ENVIRONMENTAL_SENSING, packet))
+                return;
             // store address and type
             gap_event_advertising_report_get_address(packet, server_addr);
             server_addr_type = static_cast<bd_addr_type_t>(gap_event_advertising_report_get_address_type(packet));
@@ -248,13 +251,15 @@ static void hci_event_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
             // (i.e. regardless of ENABLE_LE_ENHANCED_CONNECTION_COMPLETE_EVENT).
             switch (hci_event_gap_meta_get_subevent_code(packet)) {
                 case GAP_SUBEVENT_LE_CONNECTION_COMPLETE:
-                    if (state != TC_W4_CONNECT) return;
+                    if (state != TC_W4_CONNECT)
+                        return;
                     con_handle = gap_subevent_le_connection_complete_get_connection_handle(packet);
                     // initialize gatt client context with handle, and add it to the list of active clients
                     // query primary services
                     DEBUG_LOG("Search for env sensing service.\n");
                     state = TC_W4_SERVICE_RESULT;
-                    gatt_client_discover_primary_services_by_uuid16(handle_gatt_client_event, con_handle, ORG_BLUETOOTH_SERVICE_ENVIRONMENTAL_SENSING);
+                    gatt_client_discover_primary_services_by_uuid16(handle_gatt_client_event, con_handle,
+                                                                    ORG_BLUETOOTH_SERVICE_ENVIRONMENTAL_SENSING);
                     break;
                 default:
                     break;
@@ -263,12 +268,13 @@ static void hci_event_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
         case HCI_EVENT_DISCONNECTION_COMPLETE:
             // unregister listener
             con_handle = HCI_CON_HANDLE_INVALID;
-            if (listener_registered){
+            if (listener_registered) {
                 listener_registered = false;
                 gatt_client_stop_listening_for_characteristic_value_updates(&notification_listener);
             }
             INFO_LOG("Disconnected %s\n", bd_addr_to_str(server_addr));
-            if (state == TC_OFF) break;
+            if (state == TC_OFF)
+                break;
             client_start();
             break;
         default:
@@ -276,10 +282,12 @@ static void hci_event_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
     }
 }
 
-static void heartbeat_handler(struct btstack_timer_source *ts) {
+/// @brief Heartbeat handler (for debugging).
+static void heartbeat_handler(struct btstack_timer_source* ts)
+{
     // Invert the led
-    static bool quick_flash;
-    static bool led_on = true;
+    static bool quick_flash = false;
+    static bool led_on      = true;
 
     led_on = !led_on;
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_on);
@@ -295,52 +303,44 @@ static void heartbeat_handler(struct btstack_timer_source *ts) {
 }
 
 /// @brief Write the output to GPIO for the given command.
-///
-/// @todo Write to GPIO.
 void execute_car_command(Car_command const command)
 {
-    static constexpr std::uint32_t on_duration = 150; // in ms
-    switch (command)
-    {
-        case Car_command::LOCK:
-        {
+    static constexpr std::chrono::milliseconds on_duration{ 150 };
+
+    switch (command) {
+        case Car_command::LOCK: {
             INFO_LOG("Lock command executed.\n");
             gpio_put(lock_gpio_pin, true);
-            sleep_ms(on_duration);
+            sleep_ms(on_duration.count());
             gpio_put(lock_gpio_pin, false);
-        }
-        break;
+        } break;
 
-        case Car_command::UNLOCK:
-        {
+        case Car_command::UNLOCK: {
             INFO_LOG("Unlock command executed.\n");
             gpio_put(unlock_gpio_pin, true);
-            sleep_ms(on_duration);
+            sleep_ms(on_duration.count());
             gpio_put(unlock_gpio_pin, false);
-        }
-        break;
+        } break;
 
-        case Car_command::TRUNK:
-        {
+        case Car_command::TRUNK: {
             INFO_LOG("Trunk command executed.\n");
             gpio_put(trunk_gpio_pin, true);
-            sleep_ms(on_duration);
+            sleep_ms(on_duration.count());
             gpio_put(trunk_gpio_pin, false);
-        }
-        break;
+        } break;
 
-        default:
-        {
+        default: {
             ERROR_LOG("Unexpected car command attempted to be executed. %d\n", static_cast<int>(command));
-        }
-        break;
+        } break;
     }
 }
 
-int main() {
+int main()
+{
     stdio_init_all();
 
-    queue_init(&command_queue, sizeof(queue_entry_t), 4);
+    static constexpr uint command_queue_size = 4; // Should never receive more than that many commands before the queue can be drained.
+    queue_init(&command_queue, sizeof(queue_entry_t), command_queue_size);
 
     gpio_init(lock_gpio_pin);
     gpio_init(unlock_gpio_pin);
@@ -350,17 +350,17 @@ int main() {
     gpio_set_dir(unlock_gpio_pin, GPIO_OUT);
     gpio_set_dir(trunk_gpio_pin, GPIO_OUT);
 
-    // initialize CYW43 driver architecture (will enable BT if/because CYW43_ENABLE_BLUETOOTH == 1)
+    // Initialize CYW43 driver architecture (will enable BT if/because CYW43_ENABLE_BLUETOOTH == 1)
     if (cyw43_arch_init()) {
-        ERROR_LOG("failed to initialise cyw43_arch\n");
+        ERROR_LOG("Failed to initialise cyw43_arch\n");
         return -1;
     }
 
-    l2cap_init(); // TODO: Do we need this? Crashes?
+    l2cap_init();
     sm_init();
     sm_set_io_capabilities(IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
 
-    // setup empty ATT server - only needed if LE Peripheral does ATT queries on its own, e.g. Android and iOS
+    // Setup empty ATT server - only needed if LE Peripheral does ATT queries on its own, e.g. Android and iOS
     att_server_init(NULL, NULL, NULL);
 
     gatt_client_init();
@@ -368,26 +368,21 @@ int main() {
     hci_event_callback_registration.callback = &hci_event_handler;
     hci_add_event_handler(&hci_event_callback_registration);
 
-    // set one-shot btstack timer
     heartbeat.process = &heartbeat_handler;
     btstack_run_loop_set_timer(&heartbeat, LED_SLOW_FLASH_DELAY_MS);
     btstack_run_loop_add_timer(&heartbeat);
 
-    // turn on!
     hci_power_control(HCI_POWER_ON);
 
-    // this core is free to do it's own stuff except when using 'polling' method (in which case you should use 
-    // btstack_run_loop_ methods to add work to the run loop.
-    // this is a forever loop in place of where user code would go.
+    // This core (the non-BT core) is free to do it's own work here,
+    // except when using 'polling' method (in which case you should use btstack_run_loop_
+    // methods to add work to the run loop.
     while (true) {
-        queue_entry_t res;   
-        if (queue_try_remove(&command_queue, &res))
-        {
+        queue_entry_t res;
+        if (queue_try_remove(&command_queue, &res)) {
             execute_car_command(static_cast<Car_command>(res.data));
         }
 
         sleep_ms(1000);
     }
-
-    return 0;
 }
